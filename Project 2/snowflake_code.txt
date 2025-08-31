@@ -1,0 +1,321 @@
+/* ============================================================
+   FLIGHT DATA WAREHOUSE DESIGN
+   ------------------------------------------------------------
+   This script builds a star schema in Snowflake to analyze
+   flight data (extracted from the AviationStack API via S3).
+   It includes:
+   - Dimensions: airline, airport, flight
+   - Fact: flight performance
+   - Staging: landing table for raw files from S3
+   - Procedures + Tasks for automated ETL
+   ============================================================ */
+
+------------------------------------------------------------
+-- DIMENSION TABLES
+------------------------------------------------------------
+
+-- Airline dimension
+CREATE OR REPLACE TABLE dim_airline (
+    airline_id INT IDENTITY(1,1) PRIMARY KEY,
+    name       VARCHAR,
+    iata_code  VARCHAR,
+    icao_code  VARCHAR
+);
+
+-- Airport dimension
+CREATE OR REPLACE TABLE dim_airport (
+    airport_id   INT IDENTITY(101,1) PRIMARY KEY,
+    airport_name VARCHAR,
+    iata_code    VARCHAR,
+    icao_code    VARCHAR,
+    timezone     VARCHAR,
+    terminal     VARCHAR,
+    gate         VARCHAR
+);
+
+-- Flight dimension
+CREATE OR REPLACE TABLE dim_flight (
+    flight_id        INT IDENTITY(10001,1) PRIMARY KEY,
+    flight_number    VARCHAR,
+    iata_code        VARCHAR,
+    icao_code        VARCHAR,
+    codeshared_flag  VARCHAR
+);
+
+------------------------------------------------------------
+-- FACT TABLE
+------------------------------------------------------------
+CREATE OR REPLACE TABLE fact_flight_performance (
+    fact_id                  INT IDENTITY(1,1) PRIMARY KEY,
+    flight_date              DATETIME,
+    flight_status            VARCHAR,
+    departure_airport_id     INT REFERENCES dim_airport(airport_id),
+    scheduled_departure_time DATETIME,
+    estimated_departure_time DATETIME,
+    actual_departure_time    DATETIME,
+    departure_delay_minutes  INT,
+    arrival_airport_id       INT REFERENCES dim_airport(airport_id),
+    scheduled_arrival_time   DATETIME,
+    estimated_arrival_time   DATETIME,
+    actual_arrival_time      DATETIME,
+    arrival_delay_minutes    INT,
+    airline_id               INT REFERENCES dim_airline(airline_id),
+    flight_id                INT REFERENCES dim_flight(flight_id)
+);
+
+------------------------------------------------------------
+-- STAGING TABLE (Landing Zone for S3 data)
+------------------------------------------------------------
+CREATE OR REPLACE TABLE staging_all_airlines (
+  flight_date DATETIME,
+  flight_status VARCHAR,
+  departure_airport VARCHAR,
+  departure_timezone VARCHAR,
+  departure_iata VARCHAR,
+  departure_icao VARCHAR,
+  departure_terminal VARCHAR,
+  departure_gate VARCHAR,
+  departure_delay INT,
+  departure_scheduled DATETIME,
+  departure_estimated DATETIME,
+  departure_actual DATETIME,
+  arrival_airport VARCHAR,
+  arrival_timezone VARCHAR,
+  arrival_iata VARCHAR,
+  arrival_icao VARCHAR,
+  arrival_terminal VARCHAR,
+  arrival_gate VARCHAR,
+  arrival_baggage VARCHAR,
+  arrival_scheduled DATETIME,
+  arrival_delay INT,
+  arrival_estimated DATETIME,
+  arrival_actual DATETIME,
+  airline_name VARCHAR,
+  airline_iata VARCHAR,
+  airline_icao VARCHAR,
+  flight_number VARCHAR,
+  flight_iata VARCHAR,
+  flight_icao VARCHAR,
+  flight_codeshared VARCHAR,
+  flight_codeshared_airline_name VARCHAR,
+  flight_codeshared_airline_iata VARCHAR,
+  flight_codeshared_airline_icao VARCHAR,
+  flight_codeshared_flight_number VARCHAR,
+  flight_codeshared_flight_iata VARCHAR,
+  flight_codeshared_flight_icao VARCHAR
+);
+
+------------------------------------------------------------
+-- STORAGE INTEGRATION & STAGE
+------------------------------------------------------------
+-- NOTE: Replace ROLE ARN and bucket with your own before deploying
+-- These values are placeholders and should be managed securely
+------------------------------------------------------------
+
+CREATE OR REPLACE STORAGE INTEGRATION flight_api_integration
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = '<REPLACE_WITH_YOUR_IAM_ROLE_ARN>'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://<your-bucket-name>/')
+  COMMENT = 'Integration for loading flight data from S3 into Snowflake';
+
+-- Inspect IAM policy Snowflake requires:
+DESC INTEGRATION flight_api_integration;
+
+-- External stage pointing to processed flight data in S3
+CREATE OR REPLACE STAGE flight_data_stage
+  URL='s3://<your-bucket-name>/processed/'
+  STORAGE_INTEGRATION = flight_api_integration
+  FILE_FORMAT = (
+      TYPE = 'CSV'
+      FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+      SKIP_HEADER = 1
+  );
+
+------------------------------------------------------------
+-- COPY INTO STAGING
+------------------------------------------------------------
+COPY INTO staging_all_airlines
+FROM @flight_data_stage/all_airlines.csv
+FILE_FORMAT = (TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY = '"' SKIP_HEADER = 1)
+ON_ERROR = 'CONTINUE';
+
+-- Stream for CDC (Change Data Capture) on staging table
+CREATE OR REPLACE STREAM staging_all_airlines_stream ON TABLE staging_all_airlines;
+
+------------------------------------------------------------
+-- STORED PROCEDURES
+------------------------------------------------------------
+
+-- Load airlines into dimension
+CREATE OR REPLACE PROCEDURE process_flight_data()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+  INSERT INTO dim_airline (name, iata_code, icao_code)
+  SELECT DISTINCT s.airline_name, s.airline_iata, s.airline_icao
+  FROM staging_all_airlines_stream s
+  WHERE METADATA$ACTION = 'INSERT'
+    AND s.airline_name IS NOT NULL
+    AND s.airline_iata IS NOT NULL
+    AND s.airline_icao IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM dim_airline d
+      WHERE d.name = s.airline_name
+        AND d.iata_code = s.airline_iata
+        AND d.icao_code = s.airline_icao
+    );
+
+  RETURN 'Airline dimension updated successfully';
+END;
+$$;
+
+-- Load airports
+CREATE OR REPLACE PROCEDURE load_dim_airport()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    INSERT INTO dim_airport (airport_name, iata_code, icao_code, timezone, terminal, gate)
+    SELECT DISTINCT departure_airport, departure_iata, departure_icao,
+           departure_timezone, departure_terminal, departure_gate
+    FROM staging_all_airlines
+    WHERE departure_airport IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM dim_airport WHERE iata_code = departure_iata AND icao_code = departure_icao
+    );
+    
+    INSERT INTO dim_airport (airport_name, iata_code, icao_code, timezone, terminal, gate)
+    SELECT DISTINCT arrival_airport, arrival_iata, arrival_icao,
+           arrival_timezone, arrival_terminal, arrival_gate
+    FROM staging_all_airlines
+    WHERE arrival_airport IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM dim_airport WHERE iata_code = arrival_iata AND icao_code = arrival_icao
+    );
+
+    RETURN 'Airport dimension updated successfully';
+END;
+$$;
+
+-- Load flights
+CREATE OR REPLACE PROCEDURE load_dim_flight()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    INSERT INTO dim_flight (flight_number, iata_code, icao_code, codeshared_flag)
+    SELECT DISTINCT flight_number, flight_iata, flight_icao,
+           CASE WHEN flight_codeshared IS NOT NULL AND flight_codeshared != '' 
+                THEN 'Y' ELSE 'N' END
+    FROM staging_all_airlines
+    WHERE flight_number IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM dim_flight
+        WHERE flight_number = staging_all_airlines.flight_number
+          AND iata_code = staging_all_airlines.flight_iata
+          AND icao_code = staging_all_airlines.flight_icao
+    );
+
+    RETURN 'Flight dimension updated successfully';
+END;
+$$;
+
+-- Load fact table (flight performance)
+CREATE OR REPLACE PROCEDURE load_fact_flight_performance()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    INSERT INTO fact_flight_performance (
+        flight_date, flight_status, departure_airport_id,
+        scheduled_departure_time, estimated_departure_time, actual_departure_time,
+        departure_delay_minutes, arrival_airport_id,
+        scheduled_arrival_time, estimated_arrival_time, actual_arrival_time,
+        arrival_delay_minutes, airline_id, flight_id
+    )
+    SELECT DISTINCT
+        s.flight_date, s.flight_status,
+        dep_airport.airport_id, s.departure_scheduled, s.departure_estimated, s.departure_actual,
+        s.departure_delay, arr_airport.airport_id,
+        s.arrival_scheduled, s.arrival_estimated, s.arrival_actual,
+        s.arrival_delay, airline.airline_id, flight.flight_id
+    FROM staging_all_airlines s
+    LEFT JOIN dim_airport dep_airport ON s.departure_iata = dep_airport.iata_code AND s.departure_icao = dep_airport.icao_code
+    LEFT JOIN dim_airport arr_airport ON s.arrival_iata   = arr_airport.iata_code   AND s.arrival_icao   = arr_airport.icao_code
+    LEFT JOIN dim_airline airline     ON s.airline_iata   = airline.iata_code       AND s.airline_icao   = airline.icao_code
+    LEFT JOIN dim_flight flight       ON s.flight_number  = flight.flight_number
+                                     AND s.flight_iata    = flight.iata_code
+                                     AND s.flight_icao    = flight.icao_code
+    WHERE s.flight_date IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM fact_flight_performance f
+          WHERE f.flight_date = s.flight_date
+            AND f.flight_status = s.flight_status
+            AND f.departure_airport_id = dep_airport.airport_id
+            AND f.arrival_airport_id = arr_airport.airport_id
+            AND f.flight_id = flight.flight_id
+            AND f.scheduled_departure_time = s.departure_scheduled
+            AND f.scheduled_arrival_time = s.arrival_scheduled
+      );
+
+    RETURN 'Fact table updated successfully (new unique rows only)';
+END;
+$$;
+
+-- Orchestrator procedure (calls all loaders in sequence)
+CREATE OR REPLACE PROCEDURE process_all_flight_data()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    CALL process_flight_data();
+    CALL load_dim_airport();
+    CALL load_dim_flight();
+    CALL load_fact_flight_performance();
+    RETURN 'All flight data loaded successfully';
+END;
+$$;
+
+------------------------------------------------------------
+-- TASK (Scheduler)
+------------------------------------------------------------
+-- Note: adjust CRON schedule to your timezone requirements
+-- Example: 'USING CRON 50 18 * * * UTC' runs at 12:30 PM PKT
+------------------------------------------------------------
+
+CREATE OR REPLACE TASK process_flight_data_task
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = 'USING CRON 50 18 * * * UTC'
+AS
+  CALL process_all_flight_data();
+
+-- Enable task
+ALTER TASK process_flight_data_task RESUME;
+
+------------------------------------------------------------
+-- TESTING & HOUSEKEEPING (Run only when needed)
+------------------------------------------------------------
+-- Show scheduled tasks
+SHOW TASKS;
+
+-- Inspect tables
+SELECT * FROM staging_all_airlines;
+SELECT * FROM dim_airline;
+SELECT * FROM dim_airport;
+SELECT * FROM dim_flight;
+SELECT * FROM fact_flight_performance;
+
+-- Truncate all tables (use carefully!)
+-- TRUNCATE TABLE staging_all_airlines;
+-- TRUNCATE TABLE dim_airline;
+-- TRUNCATE TABLE dim_airport;
+-- TRUNCATE TABLE dim_flight;
+-- TRUNCATE TABLE fact_flight_performance;
