@@ -30,11 +30,11 @@ The pipeline automates the following steps:
 
 ### 🔹 ETL Flow
 
-![Flow Diagram](flow.jpeg)
+![Flow Diagram](flow.jpg)
 
 ### 🔹 Snowflake Schema
 
-![Snowflake Schema](schema.jpeg)
+![Snowflake Schema](schema.jpg)
 
 ---
 
